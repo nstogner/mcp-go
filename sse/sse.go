@@ -21,9 +21,11 @@ type message struct {
 }
 
 type Stream struct {
-	mu       sync.RWMutex
-	in       chan *mcp.Message
-	sessions map[string]*session
+	mu            sync.RWMutex
+	in            chan *mcp.Message
+	sessions      map[string]*session
+	messagesRoute string
+	sseRoute      string
 }
 
 func writeEvent(w http.ResponseWriter, id string, event string, data string) {
@@ -32,90 +34,102 @@ func writeEvent(w http.ResponseWriter, id string, event string, data string) {
 	fmt.Fprintf(w, "data: %s\n\n", data)
 }
 
-func NewStream(mux *http.ServeMux, sseRoute, messagesRoute string) *Stream {
+func NewStream(sseRoute, messagesRoute string) *Stream {
 	s := &Stream{
-		in:       make(chan *mcp.Message),
-		sessions: make(map[string]*session),
+		in:            make(chan *mcp.Message),
+		sessions:      make(map[string]*session),
+		messagesRoute: messagesRoute,
+		sseRoute:      sseRoute,
 	}
 
-	mux.HandleFunc("POST "+messagesRoute, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("session_id") == "" {
-			http.Error(w, "session_id is required", http.StatusBadRequest)
-			return
-		}
-		defer r.Body.Close()
-		body, err := io.ReadAll(r.Body)
+	return s
+}
+
+func (s *Stream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		s.HandleGetSSE(w, r)
+	} else if r.Method == "POST" {
+		s.HandlePostMessages(w, r)
+	} else {
+		http.NotFound(w, r)
+	}
+}
+
+func (s *Stream) HandleGetSSE(w http.ResponseWriter, r *http.Request) {
+	// Set headers for SSE
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Create a flusher to ensure data is sent immediately
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	id := uuid.New().String()
+	out := make(chan *mcp.Message)
+
+	s.mu.Lock()
+	s.sessions[id] = &session{
+		out: out,
+	}
+	s.mu.Unlock()
+
+	vals := r.URL.Query()
+	vals.Add("session_id", id)
+
+	session := s.messagesRoute + "?" + vals.Encode()
+
+	writeEvent(w, "1", "endpoint", session)
+	flusher.Flush()
+
+	for msg := range out {
+		bs, err := json.Marshal(msg)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		var msg mcp.Message
-		if err := json.Unmarshal(body, &msg); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		metadata := make(map[string]string)
-		for key, values := range r.URL.Query() {
-			// Always pick the last value
-			for _, value := range values {
-				metadata[key] = value
-			}
-		}
-
-		msg.Metadata = metadata
-
-		go func() {
-			s.in <- &msg
-		}()
-
-		w.WriteHeader(http.StatusNoContent)
-	})
-
-	mux.HandleFunc("GET "+sseRoute, func(w http.ResponseWriter, r *http.Request) {
-		// Set headers for SSE
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-
-		// Create a flusher to ensure data is sent immediately
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
-			return
-		}
-
-		id := uuid.New().String()
-		out := make(chan *mcp.Message)
-
-		s.mu.Lock()
-		s.sessions[id] = &session{
-			out: out,
-		}
-		s.mu.Unlock()
-
-		vals := r.URL.Query()
-		vals.Add("session_id", id)
-
-		session := messagesRoute + "?" + vals.Encode()
-
-		writeEvent(w, "1", "endpoint", session)
+		writeEvent(w, msg.ID.String(), "message", string(bs))
 		flusher.Flush()
+	}
+}
 
-		for msg := range out {
-			bs, err := json.Marshal(msg)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			writeEvent(w, msg.ID.String(), "message", string(bs))
-			flusher.Flush()
+func (s *Stream) HandlePostMessages(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("session_id") == "" {
+		http.Error(w, "session_id is required", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var msg mcp.Message
+	if err := json.Unmarshal(body, &msg); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	metadata := make(map[string]string)
+	for key, values := range r.URL.Query() {
+		// Always pick the last value
+		for _, value := range values {
+			metadata[key] = value
 		}
-	})
+	}
 
-	return s
+	msg.Metadata = metadata
+
+	go func() {
+		s.in <- &msg
+	}()
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Stream) Recv() (*mcp.Message, error) {

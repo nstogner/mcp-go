@@ -28,12 +28,11 @@ func (s *WeatherServer) Initialize(ctx context.Context, req *mcp.Request[mcp.Ini
 func main() {
 	ctx := context.Background()
 
-	mux := http.NewServeMux()
-
-	server := mcp.NewServer(sse.NewStream(mux, "/sse", "/messages"), &WeatherServer{})
+	sseStream := sse.NewStream("/sse", "/messages")
+	server := mcp.NewServer(sseStream, &WeatherServer{})
 
 	go func() {
-		if err := http.ListenAndServe(":3009", mux); err != nil {
+		if err := http.ListenAndServe(":3009", sseStream); err != nil {
 			log.Fatal(err)
 		}
 	}()
