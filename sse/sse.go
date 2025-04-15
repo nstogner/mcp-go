@@ -78,6 +78,14 @@ func (s *Stream) HandleGetSSE(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
+	// Clean up session when handler exits
+	defer func() {
+		s.mu.Lock()
+		delete(s.sessions, id)
+		s.mu.Unlock()
+		close(out)
+	}()
+
 	vals := r.URL.Query()
 	vals.Add("session_id", id)
 
@@ -86,14 +94,22 @@ func (s *Stream) HandleGetSSE(w http.ResponseWriter, r *http.Request) {
 	writeEvent(w, "1", "endpoint", session)
 	flusher.Flush()
 
-	for msg := range out {
-		bs, err := json.Marshal(msg)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+	for {
+		select {
+		case msg, ok := <-out:
+			if !ok {
+				return
+			}
+			bs, err := json.Marshal(msg)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeEvent(w, msg.ID.String(), "message", string(bs))
+			flusher.Flush()
+		case <-r.Context().Done():
 			return
 		}
-		writeEvent(w, msg.ID.String(), "message", string(bs))
-		flusher.Flush()
 	}
 }
 
@@ -103,6 +119,7 @@ func (s *Stream) HandlePostMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -125,11 +142,14 @@ func (s *Stream) HandlePostMessages(w http.ResponseWriter, r *http.Request) {
 
 	msg.Metadata = metadata
 
-	go func() {
-		s.in <- &msg
-	}()
-
-	w.WriteHeader(http.StatusNoContent)
+	// Use select to handle context cancellation
+	select {
+	case s.in <- &msg:
+		w.WriteHeader(http.StatusNoContent)
+	case <-r.Context().Done():
+		// Request was cancelled, no need to send response
+		return
+	}
 }
 
 func (s *Stream) Recv() (*mcp.Message, error) {

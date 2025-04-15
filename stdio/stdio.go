@@ -17,11 +17,24 @@ type Stream struct {
 	wlock sync.Mutex
 }
 
-func NewStream(r io.Reader, w io.Writer) *Stream {
-	return &Stream{
+type Option func(*Stream)
+
+func WithMaxScannerTokenSize(size int) Option {
+	return func(s *Stream) {
+		buf := make([]byte, 0, size)
+		s.scan.Buffer(buf, size)
+	}
+}
+
+func NewStream(r io.Reader, w io.Writer, opts ...Option) *Stream {
+	s := &Stream{
 		scan: bufio.NewScanner(r),
 		w:    w,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 func (s *Stream) Recv() (*mcp.Message, error) {
