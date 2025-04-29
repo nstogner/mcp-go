@@ -74,7 +74,15 @@ func (c *Client) ServeMCP(ctx context.Context, msg *Message) (*Message, error) {
 }
 
 func (c *Client) Initialize(ctx context.Context, request *Request[InitializeRequest]) (*Response[InitializeResponse], error) {
-	return call[InitializeRequest, InitializeResponse](ctx, c.base, "initialize", request)
+	resp, err := call[InitializeRequest, InitializeResponse](ctx, c.base, "initialize", request)
+	if err != nil {
+		return resp, err
+	}
+	// {"method":"notifications/initialized","jsonrpc":"2.0"}
+	if err := notify[emptyRequest](ctx, c.base, "notifications/initialized", &Request[emptyRequest]{}); err != nil {
+		return resp, err
+	}
+	return resp, nil
 }
 
 func (c *Client) ListResources(ctx context.Context, request *Request[ListResourcesRequest]) (*Response[ListResourcesResponse], error) {
